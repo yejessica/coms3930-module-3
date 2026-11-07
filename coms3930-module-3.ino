@@ -1,174 +1,106 @@
 /*
-  Module 3: Button Mash Game for the ESP32 LILYGO T-Display
-  Race to mash the buttons on the ESP32 the fastest.  The boards broadcast
-  their button presses to each other using ESP-NOW.  Fastest wins.
+  Module 3: ESP-NOW communication for two ESP32 LILYGO T-Display boards.
+  Both boards broadcast their state every 250 milliseconds.
+  View received messages in the Serial Monitor at 115200 baud.
 
-  Supports 2-3 players (must modify TEAM_ID and PLAYER_ID). 
-  - TEAM_ID:   should match for all members on a team
-  - PLAYER_ID: unique for each member on a team (0, 1, or 2) 
+  Use the same TEAM_ID on both boards.
+  Set PLAYER_ID to 0 on one board and 1 on the other.
 */
 
 #include <WiFi.h>
 #include <esp_now.h>
 #include <TFT_eSPI.h>
 
-#define TEAM_ID       5      // TODO: Modify based on your TEAM ID
-#define PLAYER_ID     0      // TODO: Change to 0, 1, or 2. Each group member should have a unique ID.
-#define MAX_PLAYERS   3
-#define TARGET        40     // button presses to win
-#define BUTTON_A      0      // left button (either button counts)
-#define BUTTON_B      35    // right button (either button counts)
+#define TEAM_ID       5      // TODO: Team id = 5 - can be any int just make sure that you and your pair have the same id.
+#define PLAYER_ID     1      // TODO: Use 0 on one board and 1 on the other. 0 is x direction, 1 is y direction
+#define MAX_PLAYERS   2
 #define HEARTBEAT_MS  250
+#define BUTTON_A      0      // left button
+#define BUTTON_B      35     // right button
 
-uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static_assert(PLAYER_ID == 0 || PLAYER_ID == 1, "PLAYER_ID must be 0 or 1");
 
 TFT_eSPI tft = TFT_eSPI();
 
-// counts[i] = presses by player i. Your own slot is updated in loop() while the others are filled in by the receive callback.
-volatile uint16_t counts[MAX_PLAYERS] = {0, 0, 0};
-volatile bool seen[MAX_PLAYERS]   = {false, false, false};
-volatile bool resetRequested = false;
-volatile bool needsRedraw = true;
-
-bool     gameOver = false;
-int      winnerId = -1;
-uint32_t gameOverAt = 0;
-uint32_t lastHeartbeat = 0;
-int      lastSeenCount = 0;
-
+// (0, 0) is bottom-left
+// X increases right, Y increases up.
+const int DOT_RADIUS = 5;
+const int SCREEN_WIDTH = 135;
+const int SCREEN_HEIGHT = 240;
 bool lastA = HIGH, lastB = HIGH;
-uint32_t lastPressTime = 0;
 
-const uint16_t playerColors[MAX_PLAYERS] = {TFT_CYAN, TFT_ORANGE, TFT_GREEN};
+
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+uint32_t lastHeartbeat = 0;
+
+volatile uint16_t coords[MAX_PLAYERS] = {SCREEN_WIDTH / 2, SCREEN_HEIGHT / 2};
+volatile bool received[MAX_PLAYERS] = {false, false};
+
+void drawDot() {
+  tft.fillScreen(TFT_BLACK);
+
+  // this is so that we can handle positive y = up
+  int screenY = SCREEN_HEIGHT - 1 - coords[1];
+  tft.fillCircle(coords[0], screenY, DOT_RADIUS, TFT_RED);
+}
+
 
 // message structure between devices
 typedef struct {
   uint8_t  teamId;     // which group this message belongs to
   uint8_t  playerId;   // which player in the group sent it
-  uint8_t  isReset;    // 1 = "start a new round"
-  uint16_t presses;    // sender's total button presses so far
+  uint16_t coordinate; // Sender's current X (player 0) or Y (player 1).
 } Message;
 
-// receive callback
+
 void onReceive(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len != sizeof(Message)) return;
 
   Message msg;
   memcpy(&msg, data, sizeof(msg));
-  if (msg.teamId != TEAM_ID) return;                 // msgs from a different team
-  if (msg.playerId >= MAX_PLAYERS) return;           // bad player number
-  if (msg.playerId == PLAYER_ID) return;             // two boards with the same PLAYER_ID
+  if (msg.teamId != TEAM_ID) return;
+  if (msg.playerId >= MAX_PLAYERS) return;
+  if (msg.playerId == PLAYER_ID) return;
 
-  if (msg.isReset) {
-    resetRequested = true;
-  } else {
-    counts[msg.playerId] = msg.presses;
-    seen[msg.playerId] = true;
+  if (msg.playerId == 0) {
+    coords[0] = constrain((int)msg.coordinate, DOT_RADIUS, SCREEN_WIDTH - DOT_RADIUS - 1);
+  } else if (msg.playerId == 1) {
+    coords[1] = constrain((int)msg.coordinate, DOT_RADIUS, SCREEN_HEIGHT - DOT_RADIUS - 1);
   }
-  needsRedraw = true;
+
+  received[msg.playerId] = true;
 }
 
 void setupEspNow() {
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextColor(TFT_RED);
-    tft.drawString("ESP-NOW init failed", 10, 60, 2);
+    Serial.println("ESP-NOW init failed");
     while (true) delay(1000);
   }
-  esp_now_register_recv_cb(onReceive);
+
+  if (esp_now_register_recv_cb(onReceive) != ESP_OK) {
+    Serial.println("ESP-NOW receive callback registration failed");
+    while (true) delay(1000);
+  }
 
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, broadcastAddress, 6);
   peer.channel = 0;
   peer.encrypt = false;
-  esp_now_add_peer(&peer);
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    Serial.println("ESP-NOW broadcast peer setup failed");
+    while (true) delay(1000);
+  }
 }
 
-void sendState(bool reset = false) {
-  Message msg;
-  msg.teamId   = TEAM_ID;
+void sendState() {
+  Message msg = {};
+  msg.teamId = TEAM_ID;
   msg.playerId = PLAYER_ID;
-  msg.isReset  = reset ? 1 : 0;
-  msg.presses  = counts[PLAYER_ID];
-  esp_now_send(broadcastAddress, (uint8_t *)&msg, sizeof(msg)); // where state is broadcasted
-}
+  msg.coordinate = coords[PLAYER_ID];
 
-// set up variables for drawing progress bars for each player
-const int LANE_X = 48, LANE_W = 188, LANE_H = 32, LANE_TOP = 8, LANE_STEP = 38;
-
-// drawScreen handles everything that is drawn to the built-in display
-void drawScreen() {
-  seen[PLAYER_ID] = true;                            
-
-  int numSeen = 0;
-  for (int i = 0; i < MAX_PLAYERS; i++) if (seen[i]) numSeen++;
-
-  // Only wipe the whole screen when a lane appears; otherwise redraw in place
-  // (this avoids flicker while people are mashing).
-  if (numSeen != lastSeenCount) {
-    tft.fillScreen(TFT_BLACK);
-    lastSeenCount = numSeen;
-  }
-
-  int lane = 0;
-  for (int i = 0; i < MAX_PLAYERS; i++) {
-    if (!seen[i]) continue;
-    int y = LANE_TOP + lane * LANE_STEP;
-    lane++;
-
-    int count = counts[i];
-    int fillW = constrain((count * LANE_W) / TARGET, 0, LANE_W);
-
-    // Player label and count (opaque text with padding, so old text is wiped)
-    tft.setTextPadding(44);
-    tft.setTextColor(playerColors[i], TFT_BLACK);
-    tft.drawString(i == PLAYER_ID ? "YOU" : "P" + String(i + 1), 2, y, 2);
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString(String(count), 2, y + 16, 2);
-    tft.setTextPadding(0);
-
-    // Progress bar: filled part, empty part, outline (thicker for your own lane)
-    tft.fillRect(LANE_X, y, fillW, LANE_H, playerColors[i]);
-    tft.fillRect(LANE_X + fillW, y, LANE_W - fillW, LANE_H, TFT_BLACK);
-    tft.drawRect(LANE_X - 1, y - 1, LANE_W + 2, LANE_H + 2,
-                 i == PLAYER_ID ? TFT_WHITE : TFT_DARKGREY);
-  }
-
-  // Banner strip for notifications at the bottom
-  tft.fillRect(0, 118, 240, 17, TFT_BLACK);
-  if (gameOver) {
-    tft.setTextDatum(MC_DATUM);
-    if (winnerId == PLAYER_ID) {
-      tft.setTextColor(TFT_GREEN, TFT_BLACK);
-      tft.drawString("YOU WIN!  Press for rematch", 120, 126, 2);
-    } else {
-      tft.setTextColor(TFT_RED, TFT_BLACK);
-      tft.drawString("P" + String(winnerId + 1) + " wins.  Press for rematch", 120, 126, 2);
-    }
-    tft.setTextDatum(TL_DATUM);
-  }
-}
-
-// GAME LOGIC
-void startNewRound() {
-  for (int i = 0; i < MAX_PLAYERS; i++) counts[i] = 0;
-  gameOver = false;
-  winnerId = -1;
-  needsRedraw = true;
-}
-
-void checkForWinner() {
-  if (gameOver) return;
-  int best = -1;
-  for (int i = 0; i < MAX_PLAYERS; i++) {
-    if (seen[i] && counts[i] >= TARGET && (best < 0 || counts[i] > counts[best])) best = i;
-  }
-  if (best >= 0) {
-    gameOver = true;
-    winnerId = best;
-    gameOverAt = millis();
-    needsRedraw = true;
+  if (esp_now_send(broadcastAddress, (uint8_t *)&msg, sizeof(msg)) != ESP_OK) {
+    Serial.println("ESP-NOW send failed");
   }
 }
 
@@ -181,52 +113,57 @@ bool buttonPressed(uint8_t pin, bool &last) {
 
 void setup() {
   Serial.begin(115200);
-
   pinMode(BUTTON_A, INPUT_PULLUP);
-  pinMode(BUTTON_B, INPUT);          // GPIO 35 has an external pull-up on the board
-
+  pinMode(BUTTON_B, INPUT);  // GPIO 35 uses the board's external pull-up.
   tft.init();
-  tft.setRotation(1);                // landscape, 240 x 135
-  tft.fillScreen(TFT_BLACK);
-
+  tft.setRotation(0);
+  drawDot();
   setupEspNow();
-  drawScreen();
+  Serial.printf("Player %u ready on team %u\n", PLAYER_ID, TEAM_ID);
 }
 
 void loop() {
-  if (resetRequested) {
-    resetRequested = false;
-    startNewRound();
+  bool decrease;
+  bool increase;
+
+  if (PLAYER_ID == 0) {
+    decrease = buttonPressed(BUTTON_A, lastA);
+    increase = buttonPressed(BUTTON_B, lastB);
+  } else {
+    decrease = buttonPressed(BUTTON_A, lastA);
+    increase = buttonPressed(BUTTON_B, lastB);
   }
 
-  bool a = buttonPressed(BUTTON_A, lastA);
-  bool b = buttonPressed(BUTTON_B, lastB);
-  bool pressed = (a || b) && (millis() - lastPressTime > 20); // small debounce built in
-
-  if (pressed) {
-    lastPressTime = millis();
-
-    if (!gameOver) {
-      counts[PLAYER_ID] = counts[PLAYER_ID] + 1;
-      sendState();
-      needsRedraw = true;
-    } else if (millis() - gameOverAt > 1500) {
-      startNewRound();
-      sendState(true);               // reset for everyone
+  if (decrease || increase) {
+    if (increase) {
+      coords[PLAYER_ID] += 3; // 1 barely moves
     }
+    if (decrease) {
+      coords[PLAYER_ID] -= 3;
+    }
+    int axisLimit = PLAYER_ID == 0 ? SCREEN_WIDTH : SCREEN_HEIGHT;
+    coords[PLAYER_ID] = constrain((int)coords[PLAYER_ID], DOT_RADIUS, axisLimit - DOT_RADIUS - 1);
+    sendState();
   }
 
-  checkForWinner();
+  // redraw when there's a change in coords
+  static int previousDotX = SCREEN_WIDTH / 2;
+  static int previousDotY = SCREEN_HEIGHT / 2;
+  if (coords[0] != previousDotX || coords[1] != previousDotY) {
+    drawDot();
+    previousDotX = coords[0];
+    previousDotY = coords[1];
+  }
 
-  // resend our total so a lost packet gets corrected
-  if (!gameOver && millis() - lastHeartbeat > HEARTBEAT_MS) {
+  if (millis() - lastHeartbeat >= HEARTBEAT_MS) {
     lastHeartbeat = millis();
     sendState();
   }
 
-  // only redraw only when something changed
-  if (needsRedraw) {
-    needsRedraw = false;
-    drawScreen();
+  for (int i = 0; i < MAX_PLAYERS; i++) {
+    if (received[i]) {
+      received[i] = false;
+      Serial.printf("Received from player %d: coordinate %u\n", i, (unsigned int)coords[i]);
+    }
   }
 }
