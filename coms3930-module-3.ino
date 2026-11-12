@@ -18,7 +18,7 @@
 #define BUTTON_B      35     // right button
 #define MOVE_INTERVAL_MS 30 //how often dot moves while button is held
 #define STEP 2 //px per move
-const uint32_t TIMER_DURATION_MS = 60000;
+const uint32_t TIMER_DURATION_MS = 30000;
 //maze variables
 #define ROWS 16
 #define COLS 9
@@ -48,7 +48,7 @@ const char MAZE[ROWS][COLS + 1]{ //maze array
   "w_w___w_w",
   "w_www_w_w",
   "w___w___w",
-  "wwwgw_w_w",
+  "www_w_w_w",
   "wwwwwwwww"
 };
 
