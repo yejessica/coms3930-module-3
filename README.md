@@ -1,4 +1,5 @@
 # Co-op Maze Game
+This repository contains a program to run a simple two-player co-op maze game on 2 separate ESP32s.
 ## Preview
 ![](module3-preview.gif)
 ## Required Materials
